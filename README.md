@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="CSS EDV Support / MesoXPO" width="128">
+</p>
+
 # MesoXPO Organisation - Gemeinsame GitHub-Ressourcen
 
 Dieses Repository enthält gemeinsame GitHub Actions, Workflow-Templates und Konfiguration fuer alle Repositories der MesoXPO-Organisation.
