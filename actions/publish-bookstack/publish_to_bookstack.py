@@ -454,6 +454,22 @@ def publish_to_bookstack(
 
     print(f"  Seiten: {updated} aktualisiert, {created} neu, {deleted} geloescht")
 
+    # --- Step 4b: Ensure correct page order ---
+    # BookStack may ignore priority on POST (page creation).
+    # Re-apply priority via PUT on all newly created pages.
+    if created > 0:
+        all_pages = get_book_pages(base_url, headers, book_id)
+        pages_by_name = {p["name"]: p for p in all_pages}
+        reordered = 0
+        for page in pages_data:
+            existing = pages_by_name.get(page["name"])
+            if existing and existing.get("priority") != page["priority"]:
+                update_page(base_url, headers, existing["id"],
+                            page["name"], page["markdown"], page["priority"])
+                reordered += 1
+        if reordered:
+            print(f"  Reihenfolge korrigiert: {reordered} Seiten")
+
     # --- Step 5: Upsert attachments ---
     if attachment_config and bundled_files:
         if created > 0:
