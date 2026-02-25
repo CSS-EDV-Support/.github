@@ -88,6 +88,8 @@ def split_readme_into_sections(readme_path: str) -> tuple[str, str, list[dict]]:
     current_title: str | None = None
     current_lines: list[str] = []
     in_intro = True
+    in_html_img_block = False
+    intro_image_html: list[str] = []
 
     for line in lines:
         if in_intro and line.startswith("# "):
@@ -107,7 +109,19 @@ def split_readme_into_sections(readme_path: str) -> tuple[str, str, list[dict]]:
             continue
 
         if in_intro:
-            if line.startswith("[!["):
+            stripped = line.strip()
+            if stripped.startswith("[!["):
+                continue
+            # HTML-Bild-Bloecke (z.B. zentriertes Logo) erkennen und separat
+            # erfassen, damit sie nicht in der Buchbeschreibung landen
+            if stripped.startswith("<p") and "align" in stripped:
+                in_html_img_block = True
+                intro_image_html.append(line)
+                continue
+            if in_html_img_block:
+                intro_image_html.append(line)
+                if "</p>" in stripped:
+                    in_html_img_block = False
                 continue
             current_lines.append(line)
         else:
@@ -117,6 +131,11 @@ def split_readme_into_sections(readme_path: str) -> tuple[str, str, list[dict]]:
         sections.append(
             {"title": current_title, "content": "\n".join(current_lines).strip()}
         )
+
+    # Erfasstes Logo-HTML an den Anfang der ersten Seite setzen
+    if intro_image_html and sections:
+        logo_block = "\n".join(intro_image_html).strip()
+        sections[0]["content"] = logo_block + "\n\n" + sections[0]["content"]
 
     description = "\n".join(description_lines).strip()
     return book_name, description, sections
