@@ -1,0 +1,6 @@
+{
+  "name": "Purge Old Artifacts",
+  "description": "Automatically deletes GitHub Actions artifacts older than 7 days. Runs weekly on Mondays.",
+  "iconName": "trash",
+  "categories": ["Maintenance"]
+}

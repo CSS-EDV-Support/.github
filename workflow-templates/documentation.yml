@@ -1,0 +1,35 @@
+# Template: Publish Documentation to BookStack
+# Copy this file to .github/workflows/documentation.yml in your repository
+# and adjust the inputs (book-name, product-tag, etc.) to match your project.
+#
+# Required Org-Level Secrets:
+#   BOOKSTACK_URL, BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET
+
+name: Publish Documentation to BookStack
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main          # <-- adjust to your default branch (main or master)
+    paths:
+      - 'README.md'
+
+jobs:
+  publish_docs:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Publish to BookStack
+      uses: CSS-EDV-Support/.github/actions/publish-bookstack@main
+      with:
+        book-name: ''                    # <-- set your book name, or leave empty to use H1
+        product-tag: ''                  # <-- set your product tag, or leave empty
+        bookstack-url: ${{ secrets.BOOKSTACK_URL }}
+        bookstack-token-id: ${{ secrets.BOOKSTACK_TOKEN_ID }}
+        bookstack-token-secret: ${{ secrets.BOOKSTACK_TOKEN_SECRET }}

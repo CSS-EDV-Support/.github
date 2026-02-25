@@ -1,0 +1,53 @@
+# Template: Delete old GitHub Actions artifacts
+# Copy this file to .github/workflows/purge_artifacts.yml in your repository.
+# No configuration needed - works out of the box.
+
+name: 'Delete old artifacts'
+on:
+  schedule:
+    - cron: '00 1 * * 1'  # Every Monday at 01:00 UTC
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  delete-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete artifacts older than 7 days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          CUTOFF=$(date -d '7 days ago' -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting artifacts created before $CUTOFF"
+
+          PAGE=1
+          DELETED=0
+
+          while true; do
+            RESPONSE=$(gh api "repos/${REPO}/actions/artifacts?per_page=100&page=${PAGE}" 2>/dev/null)
+            ARTIFACTS=$(echo "$RESPONSE" | jq -r ".artifacts[] | select(.created_at < \"${CUTOFF}\") | .id")
+
+            if [ -z "$ARTIFACTS" ]; then
+              TOTAL=$(echo "$RESPONSE" | jq '.artifacts | length')
+              if [ "$TOTAL" -lt 100 ]; then
+                break
+              fi
+              PAGE=$((PAGE + 1))
+              continue
+            fi
+
+            for ID in $ARTIFACTS; do
+              echo "Deleting artifact $ID"
+              gh api -X DELETE "repos/${REPO}/actions/artifacts/${ID}" 2>/dev/null || true
+              DELETED=$((DELETED + 1))
+            done
+
+            PAGE=$((PAGE + 1))
+          done
+
+          echo "Deleted $DELETED artifact(s)."

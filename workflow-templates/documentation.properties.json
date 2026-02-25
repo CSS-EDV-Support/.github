@@ -1,0 +1,6 @@
+{
+  "name": "BookStack Documentation",
+  "description": "Publishes README.md to BookStack using the shared MesoXPO composite action.",
+  "iconName": "book",
+  "categories": ["Documentation"]
+}

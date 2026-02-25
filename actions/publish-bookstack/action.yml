@@ -1,0 +1,109 @@
+name: 'Publish Documentation to BookStack'
+description: 'Converts README.md to BookStack Portable ZIP and optionally publishes via REST API'
+
+inputs:
+  readme-path:
+    description: 'Path to the README.md file'
+    required: false
+    default: 'README.md'
+  book-name:
+    description: 'Override the book name (default: extracted from H1 heading)'
+    required: false
+    default: ''
+  product-tag:
+    description: 'Product tag for BookStack metadata (default: same as book name)'
+    required: false
+    default: ''
+  instance-id:
+    description: 'Instance ID for portable ZIP (default: derived from book name)'
+    required: false
+    default: ''
+  upload:
+    description: 'Publish to BookStack via REST API (true/false)'
+    required: false
+    default: 'true'
+  collection-dir:
+    description: 'Path to Bruno API collection directory (optional, skipped if empty)'
+    required: false
+    default: ''
+  collection-name:
+    description: 'Display name for the collection attachment'
+    required: false
+    default: ''
+  collection-target-page:
+    description: 'Target page name for the collection attachment'
+    required: false
+    default: ''
+  bookstack-url:
+    description: 'BookStack instance URL'
+    required: true
+  bookstack-token-id:
+    description: 'BookStack API token ID'
+    required: true
+  bookstack-token-secret:
+    description: 'BookStack API token secret'
+    required: true
+
+outputs:
+  zip-path:
+    description: 'Path to the generated BookStack Portable ZIP file'
+    value: ${{ steps.publish.outputs.zip-path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Publish to BookStack
+      id: publish
+      shell: bash
+      env:
+        BOOKSTACK_URL: ${{ inputs.bookstack-url }}
+        BOOKSTACK_TOKEN_ID: ${{ inputs.bookstack-token-id }}
+        BOOKSTACK_TOKEN_SECRET: ${{ inputs.bookstack-token-secret }}
+      run: |
+        ARGS=()
+
+        ARGS+=("--readme" "${{ inputs.readme-path }}")
+
+        if [ -n "${{ inputs.book-name }}" ]; then
+          ARGS+=("--book-name" "${{ inputs.book-name }}")
+        fi
+
+        if [ -n "${{ inputs.product-tag }}" ]; then
+          ARGS+=("--product-tag" "${{ inputs.product-tag }}")
+        fi
+
+        if [ -n "${{ inputs.instance-id }}" ]; then
+          ARGS+=("--instance-id" "${{ inputs.instance-id }}")
+        fi
+
+        if [ -n "${{ inputs.collection-dir }}" ]; then
+          ARGS+=("--collection" "${{ inputs.collection-dir }}")
+        fi
+
+        if [ -n "${{ inputs.collection-name }}" ]; then
+          ARGS+=("--collection-name" "${{ inputs.collection-name }}")
+        fi
+
+        if [ -n "${{ inputs.collection-target-page }}" ]; then
+          ARGS+=("--collection-target-page" "${{ inputs.collection-target-page }}")
+        fi
+
+        if [ "${{ inputs.upload }}" = "true" ]; then
+          ARGS+=("--upload")
+        fi
+
+        python "${{ github.action_path }}/publish_to_bookstack.py" "${ARGS[@]}"
+
+        echo "zip-path=bookstack-import.zip" >> "$GITHUB_OUTPUT"
+
+    - name: Upload ZIP artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: bookstack-import
+        path: bookstack-import.zip
+        overwrite: true
