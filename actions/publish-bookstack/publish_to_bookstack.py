@@ -314,25 +314,87 @@ def _api_get_all(url: str, headers: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Internal link rewriting for BookStack cross-page references
+# ---------------------------------------------------------------------------
+
+def _heading_slug(text: str) -> str:
+    """Generate a GitHub-compatible heading anchor slug.
+
+    Matches GitHub's algorithm: lowercase, strip punctuation (keep Unicode
+    letters, digits, spaces, hyphens), replace spaces with hyphens.
+    """
+    slug = text.lower().strip()
+    slug = re.sub(r'[^\w\s-]', '', slug, flags=re.UNICODE)
+    slug = re.sub(r'[\s]+', '-', slug)
+    slug = re.sub(r'-+', '-', slug)
+    return slug.strip('-')
+
+
+def _build_heading_page_map(sections: list[dict]) -> dict[str, str]:
+    """Map every heading anchor slug to the H2 page title it belongs to.
+
+    Covers H2 titles themselves as well as H3–H6 sub-headings found
+    in each section's markdown content.
+    """
+    heading_map: dict[str, str] = {}
+    for section in sections:
+        page_title = section["title"]
+        heading_map[_heading_slug(page_title)] = page_title
+        for m in re.finditer(r'^#{3,6}\s+(.+)$', section["content"], re.MULTILINE):
+            heading_map[_heading_slug(m.group(1).strip())] = page_title
+    return heading_map
+
+
+def _rewrite_internal_links(
+    markdown: str,
+    current_page_title: str,
+    heading_map: dict[str, str],
+    page_slugs: dict[str, str],
+    book_slug: str,
+) -> str:
+    """Rewrite ``](#anchor)`` links that point to headings on other BookStack pages.
+
+    Same-page links are left unchanged.  Cross-page links are rewritten to
+    ``/books/{book_slug}/page/{page_slug}``.
+    """
+    def _replace(m: re.Match) -> str:
+        link_text, anchor = m.group(1), m.group(2)
+        target_page = heading_map.get(anchor)
+        if target_page is None or target_page == current_page_title:
+            return m.group(0)  # unknown or same-page -> leave as-is
+        page_slug = page_slugs.get(target_page)
+        if not page_slug:
+            return m.group(0)
+        return f"[{link_text}](/books/{book_slug}/page/{page_slug})"
+
+    return re.sub(r'\[([^\]]+)\]\(#([^)]+)\)', _replace, markdown)
+
+
+def _strip_html_anchors(markdown: str) -> str:
+    """Remove ``<a id="..."></a>`` anchor tags (used for GitHub compatibility)."""
+    return re.sub(r'<a\s+id="[^"]*"\s*>\s*</a>\s*\n?', '', markdown)
+
+
+# ---------------------------------------------------------------------------
 # BookStack upsert logic
 # ---------------------------------------------------------------------------
 
-def find_book(base_url: str, headers: dict, book_name: str) -> int | None:
-    """Find an existing book by exact name match. Returns book ID or None."""
+def find_book(base_url: str, headers: dict, book_name: str) -> tuple[int | None, str | None]:
+    """Find an existing book by exact name match. Returns (book_id, slug) or (None, None)."""
     books = _api_get_all(urljoin(base_url, "/api/books"), headers)
     for book in books:
         if book.get("name") == book_name:
-            return book["id"]
-    return None
+            return book["id"], book.get("slug", "")
+    return None, None
 
 
 def create_book(base_url: str, headers: dict, book_name: str,
-                description_html: str, tags: list[dict]) -> int:
-    """Create a new book and return its ID."""
+                description_html: str, tags: list[dict]) -> tuple[int, str]:
+    """Create a new book and return (book_id, slug)."""
     url = urljoin(base_url, "/api/books")
     payload = {"name": book_name, "description_html": description_html, "tags": tags}
     result = _api_json("POST", url, headers, payload)
-    return result["id"]
+    return result["id"], result.get("slug", "")
 
 
 def update_book(base_url: str, headers: dict, book_id: int,
@@ -431,13 +493,13 @@ def publish_to_bookstack(
     bundled_files = bundled_files or {}
 
     # --- Step 1: Find or create book ---
-    book_id = find_book(base_url, headers, book_name)
+    book_id, book_slug = find_book(base_url, headers, book_name)
     if book_id:
         print(f"  Buch gefunden: '{book_name}' (ID {book_id})")
         update_book(base_url, headers, book_id, description_html, tags)
         print(f"  Buch-Metadaten aktualisiert.")
     else:
-        book_id = create_book(base_url, headers, book_name, description_html, tags)
+        book_id, book_slug = create_book(base_url, headers, book_name, description_html, tags)
         print(f"  Neues Buch erstellt: '{book_name}' (ID {book_id})")
 
     # --- Step 2: Load existing pages for this book ---
@@ -489,7 +551,33 @@ def publish_to_bookstack(
         if reordered:
             print(f"  Reihenfolge korrigiert: {reordered} Seiten")
 
-    # --- Step 5: Upsert attachments ---
+    # --- Step 5: Rewrite cross-page internal links ---
+    if book_slug:
+        heading_map = _build_heading_page_map(
+            [{"title": p["name"], "content": p["markdown"]} for p in pages_data]
+        )
+        all_pages_for_links = get_book_pages(base_url, headers, book_id)
+        page_slug_map = {p["name"]: p["slug"] for p in all_pages_for_links}
+        page_id_map = {p["name"]: p["id"] for p in all_pages_for_links}
+
+        link_updates = 0
+        for page in pages_data:
+            original_md = page["markdown"]
+            cleaned_md = _strip_html_anchors(original_md)
+            rewritten_md = _rewrite_internal_links(
+                cleaned_md, page["name"], heading_map, page_slug_map, book_slug
+            )
+            if rewritten_md != original_md:
+                pid = page_id_map.get(page["name"])
+                if pid:
+                    update_page(base_url, headers, pid,
+                                page["name"], rewritten_md, page["priority"])
+                    link_updates += 1
+
+        if link_updates:
+            print(f"  Interne Links umgeschrieben: {link_updates} Seiten")
+
+    # --- Step 6: Upsert attachments ---
     if attachment_config and bundled_files:
         if created > 0:
             existing_pages = get_book_pages(base_url, headers, book_id)
