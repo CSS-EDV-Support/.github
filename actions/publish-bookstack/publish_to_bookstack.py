@@ -56,6 +56,86 @@ def _md_inline_to_html(text: str) -> str:
     return text
 
 
+def _convert_md_tables_to_html(markdown: str) -> str:
+    """Replace Markdown pipe tables with HTML tables.
+
+    The first two columns receive ``white-space:nowrap`` so that short
+    identifier / date values are never word-wrapped by BookStack's layout
+    engine, leaving all remaining width for the wide content column.
+
+    Lines inside fenced code blocks (``` ... ```) are skipped so that
+    example tables in code snippets are not accidentally converted.
+    """
+    lines = markdown.split('\n')
+    result: list[str] = []
+    table_buf: list[str] = []
+    in_code_fence = False
+
+    def _is_table_line(line: str) -> bool:
+        s = line.strip()
+        return s.startswith('|') and s.endswith('|') and len(s) > 2
+
+    def _flush_table() -> None:
+        if not table_buf:
+            return
+        headers: list[str] | None = None
+        body_rows: list[list[str]] = []
+
+        for tline in table_buf:
+            s = tline.strip()
+            if re.fullmatch(r'[\|\-\:\s]+', s):
+                continue
+            cells = [c.strip() for c in s.strip('|').split('|')]
+            if headers is None:
+                headers = cells
+            else:
+                body_rows.append(cells)
+
+        if not headers:
+            result.extend(table_buf)
+            return
+
+        parts: list[str] = ['<table><thead><tr>']
+        for i, h in enumerate(headers):
+            style = ' style="white-space:nowrap"' if i < 2 else ''
+            parts.append(f'<th{style}>{_md_inline_to_html(h)}</th>')
+        parts.append('</tr></thead><tbody>')
+        for row in body_rows:
+            parts.append('<tr>')
+            for i, cell in enumerate(row):
+                style = ' style="white-space:nowrap"' if i < 2 else ''
+                parts.append(f'<td{style}>{_md_inline_to_html(cell)}</td>')
+            parts.append('</tr>')
+        parts.append('</tbody></table>')
+        result.append(''.join(parts))
+
+    for line in lines:
+        if line.strip().startswith('```'):
+            in_code_fence = not in_code_fence
+            if table_buf:
+                _flush_table()
+                table_buf = []
+            result.append(line)
+            continue
+
+        if in_code_fence:
+            result.append(line)
+            continue
+
+        if _is_table_line(line):
+            table_buf.append(line)
+        else:
+            if table_buf:
+                _flush_table()
+                table_buf = []
+            result.append(line)
+
+    if table_buf:
+        _flush_table()
+
+    return '\n'.join(result)
+
+
 def _description_to_html(description: str) -> str:
     """Convert book description (Markdown) to HTML."""
     if not description:
@@ -185,7 +265,7 @@ def build_data_json(
             if a["target_page"] == section["title"]
         ]
 
-        markdown = section["content"]
+        markdown = _convert_md_tables_to_html(section["content"])
         if page_attachments:
             download_lines = ["\n\n---\n", "### Downloads\n"]
             for a in page_attachments:
@@ -733,7 +813,7 @@ def main():
         pages_data: list[dict] = []
         priority = 1
         for section in page_sections:
-            markdown = section["content"]
+            markdown = _convert_md_tables_to_html(section["content"])
 
             page_atts = [a for a in attachment_config
                          if a["target_page"] == section["title"]]
