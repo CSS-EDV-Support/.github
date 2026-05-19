@@ -14,7 +14,7 @@ If no book exists yet, it is created from scratch.
 Usage:
   python publish_to_bookstack.py --upload                          # Publish with defaults from H1
   python publish_to_bookstack.py --upload --book-name "MESO API"   # Override book name
-  python publish_to_bookstack.py --upload --product-tag "MesoXPO"  # Override product tag
+  python publish_to_bookstack.py --upload --product-tag "MesoXPO,developer-docs"  # Multi-tag (comma-separated)
   python publish_to_bookstack.py --no-collection                   # Skip API test collection
   python publish_to_bookstack.py --readme OTHER.md                 # Use different source file
 
@@ -294,7 +294,7 @@ def build_data_json(
             "description_html": desc_html,
             "pages": pages,
             "tags": [
-                {"name": "product", "value": product_tag},
+                *[{"name": "product", "value": t.strip()} for t in product_tag.split(",") if t.strip()],
                 {"name": "source", "value": "README.md"},
                 {"name": "generated", "value": datetime.now().strftime("%Y-%m-%d")},
             ],
@@ -708,7 +708,7 @@ def main():
     )
     parser.add_argument(
         "--product-tag", default=None,
-        help="Product tag for BookStack (default: same as book name)",
+        help="Product tag(s) for BookStack — comma-separated for multi-tag (default: same as book name)",
     )
     parser.add_argument(
         "--instance-id", default=None,
@@ -751,7 +751,7 @@ def main():
 
     page_sections = [s for s in sections if s["title"] != "Inhaltsverzeichnis"]
     print(f"Book: {book_name}")
-    print(f"Product tag: {product_tag}")
+    print(f"Product tag(s): {product_tag}")
     print(f"Instance ID: {instance_id}")
     print(f"Pages: {len(page_sections)}")
 
@@ -804,7 +804,7 @@ def main():
         desc_html = _description_to_html(description)
 
         tags = [
-            {"name": "product", "value": product_tag},
+            *[{"name": "product", "value": t.strip()} for t in product_tag.split(",") if t.strip()],
             {"name": "source", "value": "README.md"},
             {"name": "generated", "value": datetime.now().strftime("%Y-%m-%d")},
         ]

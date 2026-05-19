@@ -11,7 +11,7 @@ inputs:
     required: false
     default: ''
   product-tag:
-    description: 'Product tag for BookStack metadata (default: same as book name)'
+    description: 'Product tag(s) for BookStack metadata — comma-separated for multi-tag (default: same as book name)'
     required: false
     default: ''
   instance-id:
