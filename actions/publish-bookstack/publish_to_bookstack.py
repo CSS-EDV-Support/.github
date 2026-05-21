@@ -658,6 +658,7 @@ def publish_to_bookstack(
             print(f"  Interne Links umgeschrieben: {link_updates} Seiten")
 
     # --- Step 6: Upsert attachments ---
+    page_link_updates: dict[str, list[tuple[str, int]]] = {}
     if attachment_config and bundled_files:
         if created > 0:
             existing_pages = get_book_pages(base_url, headers, book_id)
@@ -677,11 +678,41 @@ def publish_to_bookstack(
                 continue
 
             page_atts = get_page_attachments(base_url, headers, page_id)
-            upsert_attachment(
+            att_result = upsert_attachment(
                 base_url, headers, page_id,
                 att["display_name"], file_bytes, att["filename"], page_atts,
             )
             print(f"    Attachment: {att['display_name']} -> {target_page_name}")
+
+            if isinstance(att_result, dict) and att_result.get("id"):
+                page_link_updates.setdefault(target_page_name, []).append(
+                    (att["display_name"], att_result["id"])
+                )
+
+    # --- Step 7: Update page content with clickable attachment links ---
+    if page_link_updates:
+        all_pages_current = get_book_pages(base_url, headers, book_id)
+        pages_by_name_current = {p["name"]: p for p in all_pages_current}
+        for target_page_name, link_list in page_link_updates.items():
+            target = pages_by_name_current.get(target_page_name)
+            if not target:
+                continue
+            page_detail = _api_request(
+                "GET", urljoin(base_url, f"/api/pages/{target['id']}"), headers
+            )
+            if not isinstance(page_detail, dict):
+                continue
+            current_md = page_detail.get("markdown", "")
+            updated_md = current_md
+            for display_name, att_id in link_list:
+                updated_md = updated_md.replace(
+                    f"- {display_name}",
+                    f"- [{display_name}](/attachments/{att_id})",
+                )
+            if updated_md != current_md:
+                update_page(base_url, headers, target["id"], target["name"],
+                            updated_md, target.get("priority", 1))
+                print(f"    Attachment-Link eingefuegt: {target_page_name}")
 
     return book_id
 
