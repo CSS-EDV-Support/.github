@@ -456,6 +456,112 @@ def _strip_html_anchors(markdown: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cross-book link rewriting (links to other MD files that are also published)
+# ---------------------------------------------------------------------------
+
+def _parse_link_map(link_map_str: str) -> dict[str, str]:
+    """Parse newline-separated ``file.md = book-name`` entries.
+
+    Lines starting with ``#`` or empty lines are ignored.  Returns
+    ``{filename: book-name}``.
+    """
+    result: dict[str, str] = {}
+    if not link_map_str:
+        return result
+    for raw_line in link_map_str.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        src, target = line.split("=", 1)
+        src = src.strip()
+        target = target.strip()
+        if src and target:
+            result[src] = target
+    return result
+
+
+def _book_name_to_slug(name: str) -> str:
+    """Derive a BookStack-compatible book slug from a book name.
+
+    Matches BookStack's default slug algorithm (Str::slug):
+    transliterate to ASCII, lowercase, non-alnum to hyphen, collapse hyphens.
+    """
+    # German umlaut transliteration
+    translit = {
+        "ä": "a", "ö": "o", "ü": "u", "ß": "ss",
+        "Ä": "a", "Ö": "o", "Ü": "u",
+    }
+    slug = "".join(translit.get(c, c) for c in name).lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-")
+
+
+def _resolve_link_map_slugs(
+    link_map: dict[str, str],
+    base_url: str | None,
+    headers: dict | None,
+) -> dict[str, str]:
+    """For each ``file.md -> book-name`` entry, resolve the book slug.
+
+    If API access is available (base_url + headers), look up the real slug
+    via BookStack API.  Otherwise (or if the book doesn't exist yet),
+    fall back to a deterministic slug derived from the book name.
+    """
+    result: dict[str, str] = {}
+    for filename, book_name in link_map.items():
+        slug = None
+        if base_url and headers:
+            try:
+                _, slug = find_book(base_url, headers, book_name)
+            except Exception:
+                slug = None
+        if not slug:
+            slug = _book_name_to_slug(book_name)
+        result[filename] = slug
+    return result
+
+
+def _rewrite_cross_book_links(markdown: str, slug_map: dict[str, str]) -> str:
+    """Rewrite ``](file.md)`` and ``](file.md#anchor)`` links to other
+    BookStack books.
+
+    Targets are matched by exact path, by basename, or by suffix match,
+    so both ``docs/foo.md`` and ``foo.md`` resolve to the same slug.
+    Anchors are dropped — BookStack page anchors would require knowledge
+    of the target book's page structure, which we don't have here.
+    """
+    if not slug_map:
+        return markdown
+
+    # Build lookup variants: exact path AND basename for each entry
+    lookup: dict[str, str] = {}
+    for path, slug in slug_map.items():
+        lookup[path] = slug
+        basename = path.rsplit("/", 1)[-1]
+        lookup.setdefault(basename, slug)
+
+    def _replace(m: re.Match) -> str:
+        link_text, target = m.group(1), m.group(2)
+        file_part = target.split("#", 1)[0]
+
+        slug = lookup.get(file_part)
+        if slug is None:
+            # Try suffix match (handles "docs/foo.md" vs "foo.md" mismatches)
+            for path, candidate in slug_map.items():
+                if file_part.endswith("/" + path) or path.endswith("/" + file_part):
+                    slug = candidate
+                    break
+
+        if slug is None:
+            return m.group(0)
+        return f"[{link_text}](/books/{slug})"
+
+    return re.sub(r"\[([^\]]+)\]\(([^)]+\.md(?:#[^)]*)?)\)", _replace, markdown)
+
+
+# ---------------------------------------------------------------------------
 # BookStack upsert logic
 # ---------------------------------------------------------------------------
 
@@ -765,6 +871,14 @@ def main():
         "--collection-target-page", default=None,
         help="Target page name for the collection attachment",
     )
+    parser.add_argument(
+        "--link-map", default=None,
+        help=(
+            "Map cross-MD-file links to other BookStack books. "
+            "Either a path to a file or an inline string with one "
+            "'filename.md = Book Name' entry per line."
+        ),
+    )
     args = parser.parse_args()
 
     readme_path = Path(args.readme)
@@ -785,6 +899,20 @@ def main():
     print(f"Product tag(s): {product_tag}")
     print(f"Instance ID: {instance_id}")
     print(f"Pages: {len(page_sections)}")
+
+    # 1b. Cross-book link rewriting: ](other.md) -> ](/books/<slug>)
+    link_map_raw = args.link_map or ""
+    if link_map_raw:
+        candidate = Path(link_map_raw)
+        if candidate.is_file():
+            link_map_raw = candidate.read_text(encoding="utf-8")
+    link_map = _parse_link_map(link_map_raw)
+    if link_map:
+        slug_map = _resolve_link_map_slugs(link_map, None, None)
+        for section in sections:
+            section["content"] = _rewrite_cross_book_links(section["content"], slug_map)
+        description = _rewrite_cross_book_links(description, slug_map)
+        print(f"Cross-book links: {len(slug_map)} target(s) mapped (deterministic slugs)")
 
     # 2. Bundle API test collection (optional)
     attachment_config: list[dict] = []

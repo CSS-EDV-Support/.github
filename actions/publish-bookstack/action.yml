@@ -34,6 +34,14 @@ inputs:
     description: 'Target page name for the collection attachment'
     required: false
     default: ''
+  link-map:
+    description: |
+      Optional mapping for cross-MD-file links. Newline-separated entries
+      in the form "filename.md = Book Name". Links to other .md files
+      that match an entry are rewritten to BookStack book URLs
+      (/books/<slug>). Anchors on cross-book links are dropped.
+    required: false
+    default: ''
   bookstack-url:
     description: 'BookStack instance URL'
     required: true
@@ -64,6 +72,10 @@ runs:
         BOOKSTACK_URL: ${{ inputs.bookstack-url }}
         BOOKSTACK_TOKEN_ID: ${{ inputs.bookstack-token-id }}
         BOOKSTACK_TOKEN_SECRET: ${{ inputs.bookstack-token-secret }}
+        # Multi-line input via env: bewahrt Zeilenumbrueche; direkte
+        # ${{ }}-Interpolation in einem Heredoc waere bei Multi-Line-Werten
+        # unzuverlaessig (Indentation wuerde brechen).
+        INPUT_LINK_MAP: ${{ inputs.link-map }}
       run: |
         ARGS=()
 
@@ -91,6 +103,12 @@ runs:
 
         if [ -n "${{ inputs.collection-target-page }}" ]; then
           ARGS+=("--collection-target-page" "${{ inputs.collection-target-page }}")
+        fi
+
+        if [ -n "$INPUT_LINK_MAP" ]; then
+          LINK_MAP_FILE=$(mktemp)
+          printf '%s\n' "$INPUT_LINK_MAP" > "$LINK_MAP_FILE"
+          ARGS+=("--link-map" "$LINK_MAP_FILE")
         fi
 
         if [ "${{ inputs.upload }}" = "true" ]; then
