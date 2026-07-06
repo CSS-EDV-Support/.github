@@ -45,15 +45,31 @@ from urllib.request import Request, urlopen
 
 def _md_inline_to_html(text: str) -> str:
     """Convert basic Markdown inline formatting to HTML."""
+    # Code-Spans zuerst extrahieren und durch Platzhalter schuetzen: Sternchen
+    # in Code (z.B. Wildcard-Muster wie `*.pdf;*.tif`) duerfen nicht von der
+    # Bold-/Italic-Konvertierung als Hervorhebung interpretiert werden.
+    code_spans: list[str] = []
+
+    def _stash_code(m: re.Match) -> str:
+        code_spans.append(m.group(1))
+        return f"\x00{len(code_spans) - 1}\x00"
+
+    text = re.sub(r'`(.+?)`', _stash_code, text)
     # Bold: **text** -> <strong>text</strong>
     text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
     # Italic: *text* -> <em>text</em>
     text = re.sub(r'\*(.+?)\*', r'<em>\1</em>', text)
-    # Inline code: `text` -> <code>text</code>
-    text = re.sub(r'`(.+?)`', r'<code>\1</code>', text)
     # Links: [text](url) -> <a href="url">text</a>
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
-    return text
+
+    # Inline code: `text` -> <code>text</code> (HTML-Sonderzeichen escapen,
+    # damit z.B. Generics wie `List<int>` nicht als Tags interpretiert werden)
+    def _restore_code(m: re.Match) -> str:
+        code = code_spans[int(m.group(1))]
+        code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return f"<code>{code}</code>"
+
+    return re.sub(r'\x00(\d+)\x00', _restore_code, text)
 
 
 def _convert_md_tables_to_html(markdown: str) -> str:
