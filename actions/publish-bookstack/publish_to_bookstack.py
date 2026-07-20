@@ -93,9 +93,19 @@ def _description_to_html(description: str) -> str:
 # README parsing
 # ---------------------------------------------------------------------------
 
+# Marker, ab dem der Rest der Datei vom Publish ausgenommen wird. Als HTML-
+# Kommentar auf GitHub unsichtbar. Nuetzlich, wenn eine README zugleich
+# ausfuehrliches Repo-README/Handbuch UND knappe Kunden-Produktseite ist:
+# alles unterhalb des Markers bleibt in der Quelldatei, erscheint aber nicht
+# im BookStack-Buch.
+BOOKSTACK_IGNORE_BELOW_MARKER = "<!-- bookstack:ignore-below -->"
+
+
 def split_readme_into_sections(readme_path: str) -> tuple[str, str, list[dict]]:
     """Split README.md by H2 headings. Returns (book_name, description, sections)."""
     content = Path(readme_path).read_text(encoding="utf-8")
+    # Alles ab dem 'ignore-below'-Marker abschneiden (bleibt in der Quelldatei).
+    content = content.split(BOOKSTACK_IGNORE_BELOW_MARKER, 1)[0]
     lines = content.split("\n")
 
     book_name = ""
