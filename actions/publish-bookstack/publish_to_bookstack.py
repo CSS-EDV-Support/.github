@@ -181,6 +181,24 @@ def bundle_collection(collection_dir: str) -> tuple[bytes | None, str | None]:
 # BookStack Portable ZIP (offline export)
 # ---------------------------------------------------------------------------
 
+# Marker, mit dem eine H2-Sektion vom Publish ausgenommen wird. Als HTML-
+# Kommentar auf GitHub unsichtbar, hier ausgewertet — nuetzlich, wenn eine
+# README zugleich Repo-README (mit Entwickler-Abschnitten) und Kunden-
+# Produktseite ist.
+BOOKSTACK_IGNORE_MARKER = "<!-- bookstack:ignore -->"
+
+
+def _section_ignored(section: dict) -> bool:
+    """True, wenn die Sektion nicht publiziert werden soll.
+
+    Ausgenommen sind das Inhaltsverzeichnis sowie jede Sektion, deren Inhalt
+    den Marker ``<!-- bookstack:ignore -->`` enthaelt.
+    """
+    if section.get("title") == "Inhaltsverzeichnis":
+        return True
+    return BOOKSTACK_IGNORE_MARKER in section.get("content", "")
+
+
 def build_data_json(
     book_name: str, description: str, sections: list[dict],
     product_tag: str, instance_id: str,
@@ -192,7 +210,7 @@ def build_data_json(
     priority = 1
 
     for section in sections:
-        if section["title"] == "Inhaltsverzeichnis":
+        if _section_ignored(section):
             continue
 
         page_attachments = [
@@ -834,7 +852,7 @@ def main():
     product_tag = args.product_tag or book_name
     instance_id = args.instance_id or book_name.lower().replace(" ", "-").replace(".", "-") + "-docs"
 
-    page_sections = [s for s in sections if s["title"] != "Inhaltsverzeichnis"]
+    page_sections = [s for s in sections if not _section_ignored(s)]
     print(f"Book: {book_name}")
     print(f"Product tag(s): {product_tag}")
     print(f"Instance ID: {instance_id}")
