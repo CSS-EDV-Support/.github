@@ -214,6 +214,7 @@ def build_data_json(
     product_tag: str, instance_id: str,
     attachment_files: list[dict] | None = None,
     images: dict[str, dict] | None = None,
+    datei_anhaenge: dict[str, dict] | None = None,
 ) -> dict:
     """Build the BookStack Portable ZIP data.json structure.
 
@@ -221,12 +222,21 @@ def build_data_json(
     ``_collect_local_images``.  Inside the ZIP those references become
     ``[[bsexport:image:<id>]]`` tokens, the same mechanism the attachments use;
     the bytes travel in ``files/<name>`` (see ``create_zip``).
+
+    ``datei_anhaenge`` does the same for links to local non-Markdown files
+    (``_collect_local_attachments``): they become page attachments, and the link
+    turns into ``[[bsexport:attachment:<id>]]``.
     """
     attachment_files = attachment_files or []
     images = images or {}
+    datei_anhaenge = datei_anhaenge or {}
     # Fortlaufende IDs -- muessen nur innerhalb des Exports eindeutig sein.
     image_ids = {src: i + 1 for i, src in enumerate(images)}
     image_url_map = {src: f"[[bsexport:image:{i}]]" for src, i in image_ids.items()}
+    # Anhang-IDs teilen sich den Nummernkreis mit der Bruno-Collection.
+    anhang_basis = len(attachment_files)
+    anhang_ids = {src: anhang_basis + i + 1 for i, src in enumerate(datei_anhaenge)}
+    anhang_url_map = {src: f"[[bsexport:attachment:{i}]]" for src, i in anhang_ids.items()}
     pages = []
     priority = 1
 
@@ -238,6 +248,14 @@ def build_data_json(
             {"id": a["id"], "name": a["display_name"], "file": a["filename"]}
             for a in attachment_files
             if a["target_page"] == section["title"]
+        ]
+        # Verlinkte Dateien: wie Bilder genau einmal deklariert, bei der ersten
+        # verwendenden Seite. Sie bekommen KEINEN Downloads-Block -- der Link
+        # steht ja schon im Text und wird unten umgeschrieben.
+        verlinkte_anhaenge = [
+            {"id": anhang_ids[src], "name": eintrag["name"], "file": eintrag["name"]}
+            for src, eintrag in datei_anhaenge.items()
+            if eintrag["pages"][0] == section["title"]
         ]
 
         # Native Markdown-Pipe-Tabellen an BookStack durchreichen: BookStacks
@@ -257,6 +275,7 @@ def build_data_json(
         ]
 
         markdown = _rewrite_image_links(section["content"], image_url_map)
+        markdown = _rewrite_file_links(markdown, anhang_url_map)
         if page_attachments:
             download_lines = ["\n\n---\n", "### Downloads\n"]
             for a in page_attachments:
@@ -269,7 +288,7 @@ def build_data_json(
             "name": section["title"],
             "markdown": markdown,
             "priority": priority,
-            "attachments": page_attachments,
+            "attachments": page_attachments + verlinkte_anhaenge,
             "images": page_images,
             "tags": [],
         })
@@ -615,6 +634,84 @@ def _rewrite_image_links(markdown: str, url_map: dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Local file links: attach to the page instead of leaving a dead relative link
+# ---------------------------------------------------------------------------
+
+# ``[Text](pfad/datei.html)`` -- ohne fuehrendes ``!`` (das waere ein Bild).
+LINK_PATTERN = re.compile(r'(?<!!)\[([^\]]+)\]\(\s*([^)\s]+)((?:\s+"[^"]*")?)\s*\)')
+
+# Diese Typen werden vor dem Anhaengen in ein ZIP verpackt. Grund: Browser
+# fuehren sie aus. Als blanker Anhang auf der Doku-Domain waere das je nach
+# BookStack-Konfiguration entweder blockiert oder unerwuenscht aktiv; als ZIP
+# laedt die Datei sauber herunter und wird lokal geoeffnet -- genau der
+# Nutzungsweg, den die Dokumentation ohnehin beschreibt.
+ZIP_VOR_ANHANG = {".html", ".htm", ".js", ".svg"}
+
+
+def _collect_local_attachments(sections: list[dict], source_dir: Path) -> dict[str, dict]:
+    """Find local non-Markdown files that the published sections link to.
+
+    Markdown-Ziele bleiben aussen vor -- die behandelt das Cross-Book-Rewriting.
+    Returns ``{path_as_written: {"name": str, "bytes": bytes, "pages": [...]}}``.
+    """
+    found: dict[str, dict] = {}
+    used_names: set[str] = set()
+
+    for section in sections:
+        if _section_ignored(section):
+            continue
+        for match in LINK_PATTERN.finditer(section["content"]):
+            src = match.group(2)
+            if not _is_local_image_path(src):   # gleiche Regeln: nur lokale Pfade
+                continue
+            # Anker abtrennen: ``nachbar.md#abschnitt`` ist ein Markdown-Ziel,
+            # keine Datei. Ohne das Abtrennen liefe es hier als "Datei nicht
+            # gefunden" auf und das Cross-Book-Rewriting bekaeme eine Warnung
+            # untergeschoben, die nicht seine ist.
+            pfad_teil = src.split("#", 1)[0]
+            if not pfad_teil or pfad_teil.lower().endswith(".md"):
+                continue
+            if src in found:
+                if section["title"] not in found[src]["pages"]:
+                    found[src]["pages"].append(section["title"])
+                continue
+
+            datei = (source_dir / pfad_teil).resolve()
+            if not datei.is_file():
+                print(f"  WARNUNG: Verlinkte Datei nicht gefunden, "
+                      f"Link bleibt unveraendert: {src}")
+                continue
+
+            if datei.suffix.lower() in ZIP_VOR_ANHANG:
+                puffer = io.BytesIO()
+                with zipfile.ZipFile(puffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr(datei.name, datei.read_bytes())
+                inhalt, name = puffer.getvalue(), f"{datei.stem}.zip"
+            else:
+                inhalt, name = datei.read_bytes(), datei.name
+
+            zaehler, stamm, endung = 1, Path(name).stem, Path(name).suffix
+            while name in used_names:
+                name = f"{stamm}-{zaehler}{endung}"
+                zaehler += 1
+            used_names.add(name)
+
+            found[src] = {"name": name, "bytes": inhalt, "pages": [section["title"]]}
+
+    return found
+
+
+def _rewrite_file_links(markdown: str, url_map: dict[str, str]) -> str:
+    """Replace local file links with whatever ``url_map`` provides for them."""
+    def _replace(m: re.Match) -> str:
+        text, src, titel = m.group(1), m.group(2), m.group(3)
+        ziel = url_map.get(src)
+        return m.group(0) if ziel is None else f"[{text}]({ziel}{titel})"
+
+    return LINK_PATTERN.sub(_replace, markdown)
+
+
+# ---------------------------------------------------------------------------
 # Cross-book link rewriting (links to other MD files that are also published)
 # ---------------------------------------------------------------------------
 
@@ -860,6 +957,7 @@ def publish_to_bookstack(
     attachment_config: list[dict] | None = None,
     bundled_files: dict[str, bytes] | None = None,
     images: dict[str, dict] | None = None,
+    datei_anhaenge: dict[str, dict] | None = None,
 ) -> int:
     """Publish content to BookStack using upsert strategy.
 
@@ -869,10 +967,12 @@ def publish_to_bookstack(
     attachment_config: list of {"display_name": str, "filename": str, "target_page": str}
     bundled_files: dict mapping filename -> bytes
     images: {path as written: entry from _collect_local_images}
+    datei_anhaenge: {path as written: entry from _collect_local_attachments}
     """
     attachment_config = attachment_config or []
     bundled_files = bundled_files or {}
     images = images or {}
+    datei_anhaenge = datei_anhaenge or {}
 
     # --- Step 1: Find or create book ---
     book_id, book_slug = find_book(base_url, headers, book_name)
@@ -967,11 +1067,27 @@ def publish_to_bookstack(
             print(f"  Bilder: {len(image_url_map)} verlinkt "
                   f"({neu} neu hochgeladen, {len(image_url_map) - neu} wiederverwendet)")
 
+        anhang_url_map: dict[str, str] = {}
+        for src, eintrag in datei_anhaenge.items():
+            ziel_seite = page_id_map.get(eintrag["pages"][0])
+            if not ziel_seite:
+                print(f"  WARNUNG: Zielseite fuer {src} nicht gefunden, "
+                      f"Link bleibt unveraendert.")
+                continue
+            ergebnis = upsert_attachment(
+                base_url, headers, ziel_seite, eintrag["name"], eintrag["bytes"],
+                eintrag["name"], get_page_attachments(base_url, headers, ziel_seite),
+            )
+            anhang_url_map[src] = f"/attachments/{ergebnis['id']}"
+        if anhang_url_map:
+            print(f"  Verlinkte Dateien: {len(anhang_url_map)} als Anhang bereitgestellt")
+
         link_updates = 0
         for page in pages_data:
             original_md = page["markdown"]
             cleaned_md = _strip_html_anchors(original_md)
             cleaned_md = _rewrite_image_links(cleaned_md, image_url_map)
+            cleaned_md = _rewrite_file_links(cleaned_md, anhang_url_map)
             rewritten_md = _rewrite_internal_links(
                 cleaned_md, page["name"], heading_map, page_slug_map, book_slug
             )
@@ -1157,7 +1273,12 @@ def main():
             print(f"Collection: {args.collection} not found, skipping.")
 
     # 3. Collect local images (relative paths resolve against the source file)
-    images = _collect_local_images(sections, Path(args.readme).resolve().parent)
+    quell_dir = Path(args.readme).resolve().parent
+    images = _collect_local_images(sections, quell_dir)
+    datei_anhaenge = _collect_local_attachments(sections, quell_dir)
+    if datei_anhaenge:
+        namen = ", ".join(e["name"] for e in datei_anhaenge.values())
+        print(f"Verlinkte Dateien: {len(datei_anhaenge)} ({namen})")
     if images:
         gesamt = sum(len(i["bytes"]) for i in images.values())
         print(f"Bilder: {len(images)} lokale Datei(en) gefunden ({gesamt:,} Bytes)")
@@ -1166,9 +1287,11 @@ def main():
     zip_attachment_files = [
         {**a, "id": i + 1} for i, a in enumerate(attachment_config)
     ]
-    zip_files = {**bundled_files, **{i["name"]: i["bytes"] for i in images.values()}}
+    zip_files = {**bundled_files,
+                 **{i["name"]: i["bytes"] for i in images.values()},
+                 **{a["name"]: a["bytes"] for a in datei_anhaenge.values()}}
     data = build_data_json(book_name, description, sections, product_tag, instance_id,
-                           zip_attachment_files, images)
+                           zip_attachment_files, images, datei_anhaenge)
     output_path = create_zip(data, args.output, zip_files)
     zip_size = Path(output_path).stat().st_size
     print(f"ZIP created: {output_path} ({zip_size:,} bytes)")
@@ -1223,7 +1346,7 @@ def main():
             book_id = publish_to_bookstack(
                 base_url, headers, book_name,
                 desc_html, tags, pages_data,
-                attachment_config, bundled_files, images,
+                attachment_config, bundled_files, images, datei_anhaenge,
             )
             book_url = f"{base_url}/books/{book_id}"
             print(f"  Book URL: {book_url}")

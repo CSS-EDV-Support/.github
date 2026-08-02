@@ -14,7 +14,9 @@ These cover the two defects that made links dead in BookStack:
 """
 
 import base64
+import io
 import tempfile
+import zipfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -244,6 +246,78 @@ class ZipExportImageTests(unittest.TestCase):
         sections = [{"title": "Seite", "content": "nur Text"}]
         data = build_data_json("Buch", "", sections, "produkt", "inst")
         self.assertEqual(data["book"]["pages"][0]["images"], [])
+
+
+class CollectLocalAttachmentsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "rechner.html").write_text("<html>Kalkulator</html>", encoding="utf-8")
+        (self.dir / "muster.pdf").write_bytes(b"%PDF-1.4 ...")
+        (self.dir / "nachbar.md").write_text("# Nachbar", encoding="utf-8")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _sammle(self, *inhalte):
+        sections = [{"title": f"Seite {i+1}", "content": c} for i, c in enumerate(inhalte)]
+        return pub._collect_local_attachments(sections, self.dir)
+
+    def test_html_is_zipped_before_attaching(self):
+        anhaenge = self._sammle("[Kalkulator](rechner.html)")
+        eintrag = anhaenge["rechner.html"]
+        self.assertEqual(eintrag["name"], "rechner.zip")
+        with zipfile.ZipFile(io.BytesIO(eintrag["bytes"])) as zf:
+            self.assertEqual(zf.namelist(), ["rechner.html"])
+            self.assertEqual(zf.read("rechner.html").decode(), "<html>Kalkulator</html>")
+
+    def test_other_types_are_attached_unchanged(self):
+        anhaenge = self._sammle("[Muster](muster.pdf)")
+        self.assertEqual(anhaenge["muster.pdf"]["name"], "muster.pdf")
+        self.assertEqual(anhaenge["muster.pdf"]["bytes"], b"%PDF-1.4 ...")
+
+    def test_markdown_targets_are_ignored(self):
+        # Die behandelt das Cross-Book-Rewriting.
+        self.assertEqual(self._sammle("[Nachbar](nachbar.md)"), {})
+
+    def test_markdown_target_with_anchor_is_ignored(self):
+        # Ohne Abtrennen des Ankers liefe das als "Datei nicht gefunden" auf.
+        self.assertEqual(self._sammle("[Nachbar](nachbar.md#abschnitt)"), {})
+
+    def test_pure_anchor_link_is_ignored(self):
+        self.assertEqual(self._sammle("[Oben](#ueberblick)"), {})
+
+    def test_images_are_not_treated_as_attachments(self):
+        self.assertEqual(self._sammle("![Bild](rechner.html)"), {})
+
+    def test_remote_and_missing_targets_are_skipped(self):
+        self.assertEqual(self._sammle("[X](https://example.com/a.html)"), {})
+        self.assertEqual(self._sammle("[X](fehlt.html)"), {})
+
+    def test_same_file_on_two_pages_collected_once(self):
+        anhaenge = self._sammle("[A](rechner.html)", "[B](rechner.html)")
+        self.assertEqual(len(anhaenge), 1)
+        self.assertEqual(anhaenge["rechner.html"]["pages"], ["Seite 1", "Seite 2"])
+
+    def test_zip_export_declares_attachment_and_rewrites_link(self):
+        sections = [{"title": "Seite", "content": "[Kalkulator](rechner.html)"}]
+        anhaenge = pub._collect_local_attachments(sections, self.dir)
+        data = build_data_json("Buch", "", sections, "t", "i", None, None, anhaenge)
+        seite = data["book"]["pages"][0]
+        self.assertEqual(seite["markdown"], "[Kalkulator]([[bsexport:attachment:1]])")
+        self.assertEqual(
+            seite["attachments"],
+            [{"id": 1, "name": "rechner.zip", "file": "rechner.zip"}],
+        )
+
+    def test_attachment_ids_do_not_collide_with_collection(self):
+        # Die Bruno-Collection belegt ID 1, die verlinkte Datei muss danach kommen.
+        sections = [{"title": "Seite", "content": "[Kalkulator](rechner.html)"}]
+        anhaenge = pub._collect_local_attachments(sections, self.dir)
+        collection = [{"id": 1, "display_name": "API-Tests",
+                       "filename": "api.zip", "target_page": "Seite"}]
+        data = build_data_json("Buch", "", sections, "t", "i", collection, None, anhaenge)
+        ids = [a["id"] for a in data["book"]["pages"][0]["attachments"]]
+        self.assertEqual(ids, [1, 2])
+        self.assertIn("[[bsexport:attachment:2]]", data["book"]["pages"][0]["markdown"])
 
 
 class UpsertGalleryImageTests(unittest.TestCase):
