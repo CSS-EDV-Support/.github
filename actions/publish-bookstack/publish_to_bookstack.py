@@ -35,7 +35,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -370,50 +370,124 @@ def _heading_slug(text: str) -> str:
 
     Matches GitHub's algorithm: lowercase, strip punctuation (keep Unicode
     letters, digits, spaces, hyphens), replace spaces with hyphens.
+
+    Every single whitespace character becomes one hyphen, and consecutive
+    hyphens are **not** collapsed -- that is what github-slugger does::
+
+        .replace(/[^\\w\\s-]/g, '').replace(/\\s/g, '-')
+
+    ``## Anmeldung & Sitzung`` therefore yields ``anmeldung--sitzung``: removing
+    the ``&`` leaves two spaces, and each becomes its own hyphen.  That is the
+    form the links in the markdown use.  Collapsing whitespace runs (``\\s+``)
+    made every heading containing ``&`` unresolvable, so those links were
+    silently left untouched and ended up dead in BookStack.
     """
     slug = text.lower().strip()
     slug = re.sub(r'[^\w\s-]', '', slug, flags=re.UNICODE)
-    slug = re.sub(r'[\s]+', '-', slug)
-    slug = re.sub(r'-+', '-', slug)
-    return slug.strip('-')
+    return re.sub(r'\s', '-', slug).strip('-')
 
 
-def _build_heading_page_map(sections: list[dict]) -> dict[str, str]:
-    """Map every heading anchor slug to the H2 page title it belongs to.
+def _php_strtolower(text: str) -> str:
+    """Lowercase ASCII letters only -- what PHP's byte-wise ``strtolower`` does.
 
-    Covers H2 titles themselves as well as H3–H6 sub-headings found
-    in each section's markdown content.
+    BookStack lowercases heading text with ``strtolower``, not ``mb_strtolower``,
+    so non-ASCII uppercase letters survive: ``Änderungen`` stays ``Änderungen``.
     """
-    heading_map: dict[str, str] = {}
+    return ''.join(c.lower() if 'A' <= c <= 'Z' else c for c in text)
+
+
+def _bookstack_anchor_id(heading_text: str, used_ids: set[str]) -> str:
+    """Reproduce the element id BookStack assigns to a heading.
+
+    From ``PageContent::setUniqueId``::
+
+        $contentId = 'bkmrk-' . mb_substr(strtolower(preg_replace('/\\s+/', '-',
+                                trim($element->nodeValue))), 0, 20);
+        $newId = urlencode($contentId);
+        while (isset($idMap[$newId])) { $newId = urlencode($contentId . '-' . $i++); }
+
+    So: whitespace to hyphens, lowercase (ASCII only), cut to 20 characters,
+    prefix ``bkmrk-``, url-encode, disambiguate duplicates with a counter.
+
+    Two caveats this cannot fully model, both rare:
+
+    * BookStack numbers duplicates across **all** block elements of a page, not
+      just headings.  If a paragraph and a heading share their first 20
+      characters, the counter suffix can differ from what we compute here.
+    * ``nodeValue`` is the rendered text.  A heading carrying inline markup
+      (``### Der **wichtige** Teil``) renders without the markers, while we see
+      the raw markdown.
+    """
+    base = 'bkmrk-' + _php_strtolower(re.sub(r'\s+', '-', heading_text.strip()))[:20]
+    candidate = quote(base, safe='-_.')
+    loop_index = 1
+    while candidate in used_ids:
+        candidate = quote(f'{base}-{loop_index}', safe='-_.')
+        loop_index += 1
+    used_ids.add(candidate)
+    return candidate
+
+
+def _build_heading_page_map(sections: list[dict]) -> dict[str, dict]:
+    """Map every heading anchor slug to its target page and BookStack anchor.
+
+    Returns ``{github_slug: {"page": <H2 page title>, "anchor": <bkmrk id|None>}}``.
+    Covers H2 titles themselves as well as H3–H6 sub-headings found in each
+    section's markdown content.  ``anchor`` is ``None`` for the H2 titles: they
+    become the page name and are not part of the page body, so there is no
+    element to jump to.
+    """
+    heading_map: dict[str, dict] = {}
     for section in sections:
         page_title = section["title"]
-        heading_map[_heading_slug(page_title)] = page_title
+        heading_map[_heading_slug(page_title)] = {"page": page_title, "anchor": None}
+        # Anchor ids are handed out per page in document order -- same as BookStack.
+        used_ids: set[str] = set()
         for m in re.finditer(r'^#{3,6}\s+(.+)$', section["content"], re.MULTILINE):
-            heading_map[_heading_slug(m.group(1).strip())] = page_title
+            heading_text = m.group(1).strip()
+            heading_map[_heading_slug(heading_text)] = {
+                "page": page_title,
+                "anchor": _bookstack_anchor_id(heading_text, used_ids),
+            }
     return heading_map
 
 
 def _rewrite_internal_links(
     markdown: str,
     current_page_title: str,
-    heading_map: dict[str, str],
+    heading_map: dict[str, dict],
     page_slugs: dict[str, str],
     book_slug: str,
 ) -> str:
-    """Rewrite ``](#anchor)`` links that point to headings on other BookStack pages.
+    """Rewrite ``](#anchor)`` links so they keep working inside BookStack.
 
-    Same-page links are left unchanged.  Cross-page links are rewritten to
-    ``/books/{book_slug}/page/{page_slug}``.
+    GitHub heading slugs do not exist in BookStack -- it assigns its own
+    ``bkmrk-*`` ids -- so links are rewritten in every case:
+
+    * same page, sub-heading  -> ``#bkmrk-...``
+    * same page, own H2 title -> ``/books/{book}/page/{page}`` (top of page)
+    * other page              -> ``/books/{book}/page/{page}[#bkmrk-...]``
+
+    Anchors whose target heading is unknown are left untouched.
     """
     def _replace(m: re.Match) -> str:
         link_text, anchor = m.group(1), m.group(2)
-        target_page = heading_map.get(anchor)
-        if target_page is None or target_page == current_page_title:
-            return m.group(0)  # unknown or same-page -> leave as-is
-        page_slug = page_slugs.get(target_page)
+        target = heading_map.get(anchor)
+        if target is None:
+            return m.group(0)  # unknown target -> leave as-is
+        if target["page"] == current_page_title:
+            if target["anchor"]:
+                return f"[{link_text}](#{target['anchor']})"
+            # Link to the page's own title: nothing to jump to, point at the page.
+            page_slug = page_slugs.get(current_page_title)
+            if not page_slug:
+                return m.group(0)
+            return f"[{link_text}](/books/{book_slug}/page/{page_slug})"
+        page_slug = page_slugs.get(target["page"])
         if not page_slug:
             return m.group(0)
-        return f"[{link_text}](/books/{book_slug}/page/{page_slug})"
+        fragment = f"#{target['anchor']}" if target["anchor"] else ""
+        return f"[{link_text}](/books/{book_slug}/page/{page_slug}{fragment})"
 
     return re.sub(r'\[([^\]]+)\]\(#([^)]+)\)', _replace, markdown)
 
