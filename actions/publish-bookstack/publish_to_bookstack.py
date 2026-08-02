@@ -213,9 +213,20 @@ def build_data_json(
     book_name: str, description: str, sections: list[dict],
     product_tag: str, instance_id: str,
     attachment_files: list[dict] | None = None,
+    images: dict[str, dict] | None = None,
 ) -> dict:
-    """Build the BookStack Portable ZIP data.json structure."""
+    """Build the BookStack Portable ZIP data.json structure.
+
+    ``images`` maps the path as written in the markdown to the entry produced by
+    ``_collect_local_images``.  Inside the ZIP those references become
+    ``[[bsexport:image:<id>]]`` tokens, the same mechanism the attachments use;
+    the bytes travel in ``files/<name>`` (see ``create_zip``).
+    """
     attachment_files = attachment_files or []
+    images = images or {}
+    # Fortlaufende IDs -- muessen nur innerhalb des Exports eindeutig sein.
+    image_ids = {src: i + 1 for i, src in enumerate(images)}
+    image_url_map = {src: f"[[bsexport:image:{i}]]" for src, i in image_ids.items()}
     pages = []
     priority = 1
 
@@ -233,7 +244,19 @@ def build_data_json(
         # eigener Renderer stylt sie (Rahmen, responsives Umbrechen). Roh-HTML-
         # Tabellen blieben ungestylt (rahmenlos) — daher bewusst KEINE HTML-
         # Umwandlung mehr.
-        markdown = section["content"]
+        # Ein Bild wird genau einmal deklariert -- bei der ersten Seite, die es
+        # verwendet. BookStacks Import verlangt eindeutige Bild-IDs; eine zweite
+        # Deklaration derselben ID (Bild auf mehreren Seiten) verletzt das. Der
+        # [[bsexport:image:N]]-Verweis funktioniert seitenuebergreifend, weil die
+        # IDs fuer den gesamten Export gelten.
+        page_images = [
+            {"id": image_ids[src], "name": eintrag["name"],
+             "file": eintrag["name"], "type": "gallery"}
+            for src, eintrag in images.items()
+            if eintrag["pages"][0] == section["title"]
+        ]
+
+        markdown = _rewrite_image_links(section["content"], image_url_map)
         if page_attachments:
             download_lines = ["\n\n---\n", "### Downloads\n"]
             for a in page_attachments:
@@ -247,7 +270,7 @@ def build_data_json(
             "markdown": markdown,
             "priority": priority,
             "attachments": page_attachments,
-            "images": [],
+            "images": page_images,
             "tags": [],
         })
         priority += 1
@@ -498,6 +521,100 @@ def _strip_html_anchors(markdown: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Local images: upload to BookStack instead of leaving relative paths behind
+# ---------------------------------------------------------------------------
+
+# ``![alt](pfad/bild.png "optionaler Titel")`` -- the title part is preserved.
+IMAGE_PATTERN = re.compile(r'!\[([^\]]*)\]\(\s*([^)\s]+)((?:\s+"[^"]*")?)\s*\)')
+
+# BookStack only accepts these in its image gallery (ZipExportImage validation).
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _is_local_image_path(path: str) -> bool:
+    """True for paths that point at a file next to the markdown source.
+
+    Absolute URLs (``https://``), protocol-relative (``//``), root-relative
+    (``/img/x.png``) and data URIs are left alone -- they already resolve.
+    """
+    if not path or path.startswith(("http://", "https://", "//", "/", "data:", "#")):
+        return False
+    return "://" not in path
+
+
+def _collect_local_images(sections: list[dict], source_dir: Path) -> dict[str, dict]:
+    """Find every local image referenced by the published sections.
+
+    Returns ``{path_as_written: {"path": Path, "name": str, "bytes": bytes,
+    "mime": str, "pages": [page title, ...]}}``.  Missing files and formats
+    BookStack rejects are reported and left untouched, so a broken reference
+    stays visible instead of silently disappearing.
+    """
+    found: dict[str, dict] = {}
+    used_names: set[str] = set()
+
+    for section in sections:
+        if _section_ignored(section):
+            continue
+        for match in IMAGE_PATTERN.finditer(section["content"]):
+            src = match.group(2)
+            if not _is_local_image_path(src):
+                continue
+            if src in found:
+                if section["title"] not in found[src]["pages"]:
+                    found[src]["pages"].append(section["title"])
+                continue
+
+            datei = (source_dir / src).resolve()
+            suffix = datei.suffix.lower()
+            if not datei.is_file():
+                print(f"  WARNUNG: Bild nicht gefunden, Referenz bleibt unveraendert: {src}")
+                continue
+            if suffix not in IMAGE_EXTENSIONS:
+                print(f"  WARNUNG: Format von BookStack nicht unterstuetzt ({suffix}), "
+                      f"Referenz bleibt unveraendert: {src}")
+                continue
+
+            # Dateiname muss innerhalb des Exports eindeutig sein -- gleiche
+            # Basisnamen aus verschiedenen Ordnern sonst ueberschreiben sich.
+            name = datei.name
+            stamm, endung = datei.stem, datei.suffix
+            zaehler = 1
+            while name in used_names:
+                name = f"{stamm}-{zaehler}{endung}"
+                zaehler += 1
+            used_names.add(name)
+
+            found[src] = {
+                "path": datei,
+                "name": name,
+                "bytes": datei.read_bytes(),
+                "mime": IMAGE_MIME_TYPES[suffix],
+                "pages": [section["title"]],
+            }
+
+    return found
+
+
+def _rewrite_image_links(markdown: str, url_map: dict[str, str]) -> str:
+    """Replace local image paths with whatever ``url_map`` provides for them."""
+    def _replace(m: re.Match) -> str:
+        alt, src, titel = m.group(1), m.group(2), m.group(3)
+        ziel = url_map.get(src)
+        return m.group(0) if ziel is None else f"![{alt}]({ziel}{titel})"
+
+    return IMAGE_PATTERN.sub(_replace, markdown)
+
+
+# ---------------------------------------------------------------------------
 # Cross-book link rewriting (links to other MD files that are also published)
 # ---------------------------------------------------------------------------
 
@@ -702,12 +819,47 @@ def upsert_attachment(base_url: str, headers: dict, page_id: int,
         return _api_request("POST", url, headers, data=body, content_type=ct)
 
 
+def get_gallery_images(base_url: str, headers: dict) -> list[dict]:
+    """Get every image in the gallery (used to recognise earlier uploads)."""
+    return _api_get_all(urljoin(base_url, "/api/image-gallery"), headers)
+
+
+def upsert_gallery_image(base_url: str, headers: dict, page_id: int,
+                         name: str, file_bytes: bytes, mime: str,
+                         existing_images: list[dict]) -> str:
+    """Upload an image to a page's gallery, or reuse the one already there.
+
+    Wiedererkennung ueber Name **und** Zielseite: Ohne sie legt jeder Publish-Lauf
+    eine weitere Kopie an, weil BookStack den Dateinamen beim Upload eindeutig
+    macht (``bild.png`` -> ``bild-2.png``).  Die Galerie liefe damit bei jedem
+    Doku-Commit voll.
+
+    Returns the image URL to put into the markdown.
+    """
+    for img in existing_images:
+        if img.get("name") == name and img.get("uploaded_to") == page_id:
+            return img["url"]
+
+    url = urljoin(base_url, "/api/image-gallery")
+    body, ct = _build_multipart(
+        {"type": "gallery", "uploaded_to": str(page_id), "name": name},
+        {"image": (name, file_bytes, mime)},
+    )
+    antwort = _api_request("POST", url, headers, data=body, content_type=ct)
+    # Damit ein zweites Bild derselben Seite im selben Lauf nicht erneut hochlaedt.
+    existing_images.append({
+        "name": name, "uploaded_to": page_id, "url": antwort["url"],
+    })
+    return antwort["url"]
+
+
 def publish_to_bookstack(
     base_url: str, headers: dict, book_name: str,
     description_html: str, tags: list[dict],
     pages_data: list[dict],
     attachment_config: list[dict] | None = None,
     bundled_files: dict[str, bytes] | None = None,
+    images: dict[str, dict] | None = None,
 ) -> int:
     """Publish content to BookStack using upsert strategy.
 
@@ -716,9 +868,11 @@ def publish_to_bookstack(
     pages_data: list of {"name": str, "markdown": str, "priority": int}
     attachment_config: list of {"display_name": str, "filename": str, "target_page": str}
     bundled_files: dict mapping filename -> bytes
+    images: {path as written: entry from _collect_local_images}
     """
     attachment_config = attachment_config or []
     bundled_files = bundled_files or {}
+    images = images or {}
 
     # --- Step 1: Find or create book ---
     book_id, book_slug = find_book(base_url, headers, book_name)
@@ -779,7 +933,11 @@ def publish_to_bookstack(
         if reordered:
             print(f"  Reihenfolge korrigiert: {reordered} Seiten")
 
-    # --- Step 5: Rewrite cross-page internal links ---
+    # --- Step 5: Rewrite internal links and upload local images ---
+    #
+    # Beides in einem Durchgang, damit pro Seite nur ein update_page noetig ist.
+    # Die Bilder brauchen die Seiten-IDs (uploaded_to), koennen also erst hier
+    # hochgeladen werden -- nicht schon beim Anlegen der Seiten.
     if book_slug:
         heading_map = _build_heading_page_map(
             [{"title": p["name"], "content": p["markdown"]} for p in pages_data]
@@ -788,10 +946,32 @@ def publish_to_bookstack(
         page_slug_map = {p["name"]: p["slug"] for p in all_pages_for_links}
         page_id_map = {p["name"]: p["id"] for p in all_pages_for_links}
 
+        image_url_map: dict[str, str] = {}
+        if images:
+            vorhandene = get_gallery_images(base_url, headers)
+            vorher = len(vorhandene)
+            for src, eintrag in images.items():
+                # Ein Bild gehoert genau einer Seite (uploaded_to). Wird es auf
+                # mehreren Seiten referenziert, laedt es die erste hoch; die
+                # anderen binden dieselbe URL ein.
+                ziel_seite = page_id_map.get(eintrag["pages"][0])
+                if not ziel_seite:
+                    print(f"  WARNUNG: Zielseite fuer {src} nicht gefunden, "
+                          f"Referenz bleibt unveraendert.")
+                    continue
+                image_url_map[src] = upsert_gallery_image(
+                    base_url, headers, ziel_seite, eintrag["name"],
+                    eintrag["bytes"], eintrag["mime"], vorhandene,
+                )
+            neu = len(vorhandene) - vorher
+            print(f"  Bilder: {len(image_url_map)} verlinkt "
+                  f"({neu} neu hochgeladen, {len(image_url_map) - neu} wiederverwendet)")
+
         link_updates = 0
         for page in pages_data:
             original_md = page["markdown"]
             cleaned_md = _strip_html_anchors(original_md)
+            cleaned_md = _rewrite_image_links(cleaned_md, image_url_map)
             rewritten_md = _rewrite_internal_links(
                 cleaned_md, page["name"], heading_map, page_slug_map, book_slug
             )
@@ -976,17 +1156,24 @@ def main():
         else:
             print(f"Collection: {args.collection} not found, skipping.")
 
-    # 3. Build Portable ZIP (always, for artifact/offline use)
+    # 3. Collect local images (relative paths resolve against the source file)
+    images = _collect_local_images(sections, Path(args.readme).resolve().parent)
+    if images:
+        gesamt = sum(len(i["bytes"]) for i in images.values())
+        print(f"Bilder: {len(images)} lokale Datei(en) gefunden ({gesamt:,} Bytes)")
+
+    # 4. Build Portable ZIP (always, for artifact/offline use)
     zip_attachment_files = [
         {**a, "id": i + 1} for i, a in enumerate(attachment_config)
     ]
+    zip_files = {**bundled_files, **{i["name"]: i["bytes"] for i in images.values()}}
     data = build_data_json(book_name, description, sections, product_tag, instance_id,
-                           zip_attachment_files)
-    output_path = create_zip(data, args.output, bundled_files)
+                           zip_attachment_files, images)
+    output_path = create_zip(data, args.output, zip_files)
     zip_size = Path(output_path).stat().st_size
     print(f"ZIP created: {output_path} ({zip_size:,} bytes)")
 
-    # 4. Publish via REST API
+    # 5. Publish via REST API
     if args.upload:
         base_url = os.environ.get("BOOKSTACK_URL", "").rstrip("/")
         token_id = os.environ.get("BOOKSTACK_TOKEN_ID", "")
@@ -1036,7 +1223,7 @@ def main():
             book_id = publish_to_bookstack(
                 base_url, headers, book_name,
                 desc_html, tags, pages_data,
-                attachment_config, bundled_files,
+                attachment_config, bundled_files, images,
             )
             book_url = f"{base_url}/books/{book_id}"
             print(f"  Book URL: {book_url}")
