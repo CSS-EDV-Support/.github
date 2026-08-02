@@ -1068,19 +1068,36 @@ def publish_to_bookstack(
                   f"({neu} neu hochgeladen, {len(image_url_map) - neu} wiederverwendet)")
 
         anhang_url_map: dict[str, str] = {}
-        for src, eintrag in datei_anhaenge.items():
-            ziel_seite = page_id_map.get(eintrag["pages"][0])
-            if not ziel_seite:
-                print(f"  WARNUNG: Zielseite fuer {src} nicht gefunden, "
-                      f"Link bleibt unveraendert.")
-                continue
-            ergebnis = upsert_attachment(
-                base_url, headers, ziel_seite, eintrag["name"], eintrag["bytes"],
-                eintrag["name"], get_page_attachments(base_url, headers, ziel_seite),
-            )
-            anhang_url_map[src] = f"/attachments/{ergebnis['id']}"
-        if anhang_url_map:
-            print(f"  Verlinkte Dateien: {len(anhang_url_map)} als Anhang bereitgestellt")
+        if datei_anhaenge:
+            # Einmal alle Anhaenge holen statt je Datei -- get_page_attachments
+            # laedt intern ohnehin die komplette Liste und filtert nur danach.
+            alle_anhaenge = _api_get_all(urljoin(base_url, "/api/attachments"), headers)
+            neu = ersetzt = 0
+            for src, eintrag in datei_anhaenge.items():
+                ziel_seite = page_id_map.get(eintrag["pages"][0])
+                if not ziel_seite:
+                    print(f"  WARNUNG: Zielseite fuer {src} nicht gefunden, "
+                          f"Link bleibt unveraendert.")
+                    continue
+                seiten_anhaenge = [a for a in alle_anhaenge
+                                   if a.get("uploaded_to") == ziel_seite]
+                war_vorhanden = any(a.get("name") == eintrag["name"]
+                                    for a in seiten_anhaenge)
+                ergebnis = upsert_attachment(
+                    base_url, headers, ziel_seite, eintrag["name"],
+                    eintrag["bytes"], eintrag["name"], seiten_anhaenge,
+                )
+                if war_vorhanden:
+                    ersetzt += 1
+                else:
+                    neu += 1
+                    # Damit eine zweite Datei desselben Laufs sie schon sieht.
+                    alle_anhaenge.append({"name": eintrag["name"],
+                                          "uploaded_to": ziel_seite,
+                                          "id": ergebnis["id"]})
+                anhang_url_map[src] = f"/attachments/{ergebnis['id']}"
+            print(f"  Verlinkte Dateien: {len(anhang_url_map)} als Anhang bereitgestellt "
+                  f"({neu} neu, {ersetzt} vorhandene aktualisiert)")
 
         link_updates = 0
         for page in pages_data:
