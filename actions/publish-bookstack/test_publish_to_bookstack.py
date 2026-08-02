@@ -13,13 +13,27 @@ These cover the two defects that made links dead in BookStack:
   heading slugs with its own ``bkmrk-*`` ids.
 """
 
+import base64
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+import publish_to_bookstack as pub
 from publish_to_bookstack import (
     _bookstack_anchor_id,
     _build_heading_page_map,
+    _collect_local_images,
     _heading_slug,
+    _is_local_image_path,
+    _rewrite_image_links,
     _rewrite_internal_links,
+    build_data_json,
+)
+
+# Kleinstes gueltiges PNG (1x1 transparent) -- reicht, es wird nur durchgereicht.
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 )
 
 
@@ -119,6 +133,164 @@ class RewriteInternalLinksTests(unittest.TestCase):
     def test_external_links_are_left_untouched(self):
         markdown = "siehe [Handbuch](https://example.com/a#b)"
         self.assertEqual(self._rewrite(markdown), markdown)
+
+
+class LocalImagePathTests(unittest.TestCase):
+    def test_relative_paths_are_local(self):
+        self.assertTrue(_is_local_image_path("bilder/suche.png"))
+        self.assertTrue(_is_local_image_path("./bilder/suche.png"))
+
+    def test_absolute_and_remote_paths_are_not(self):
+        for pfad in ["https://example.com/a.png", "http://example.com/a.png",
+                     "//example.com/a.png", "/img/a.png", "data:image/png;base64,AAA"]:
+            with self.subTest(pfad=pfad):
+                self.assertFalse(_is_local_image_path(pfad))
+
+
+class CollectLocalImagesTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "bilder").mkdir()
+        (self.dir / "bilder" / "suche.png").write_bytes(PNG_1PX)
+        (self.dir / "bilder" / "notiz.svg").write_bytes(b"<svg/>")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _sammle(self, *inhalte):
+        sections = [{"title": f"Seite {i+1}", "content": c} for i, c in enumerate(inhalte)]
+        return _collect_local_images(sections, self.dir)
+
+    def test_finds_local_image_and_reads_bytes(self):
+        bilder = self._sammle("Text\n\n![Suche](bilder/suche.png)\n")
+        self.assertEqual(list(bilder), ["bilder/suche.png"])
+        eintrag = bilder["bilder/suche.png"]
+        self.assertEqual(eintrag["bytes"], PNG_1PX)
+        self.assertEqual(eintrag["mime"], "image/png")
+        self.assertEqual(eintrag["pages"], ["Seite 1"])
+
+    def test_image_used_on_two_pages_is_collected_once(self):
+        bilder = self._sammle("![A](bilder/suche.png)", "![B](bilder/suche.png)")
+        self.assertEqual(len(bilder), 1)
+        self.assertEqual(bilder["bilder/suche.png"]["pages"], ["Seite 1", "Seite 2"])
+
+    def test_remote_images_are_ignored(self):
+        self.assertEqual(self._sammle("![X](https://example.com/a.png)"), {})
+
+    def test_missing_file_is_skipped(self):
+        self.assertEqual(self._sammle("![X](bilder/fehlt.png)"), {})
+
+    def test_unsupported_format_is_skipped(self):
+        # BookStack nimmt nur png/jpeg/gif/webp an.
+        self.assertEqual(self._sammle("![X](bilder/notiz.svg)"), {})
+
+    def test_ignored_sections_contribute_nothing(self):
+        sections = [{"title": "Intern",
+                     "content": "<!-- bookstack:ignore -->\n![X](bilder/suche.png)"}]
+        self.assertEqual(_collect_local_images(sections, self.dir), {})
+
+
+class RewriteImageLinksTests(unittest.TestCase):
+    def test_replaces_only_known_paths(self):
+        md = "![Suche](bilder/suche.png) und ![Extern](https://example.com/a.png)"
+        ergebnis = _rewrite_image_links(md, {"bilder/suche.png": "/uploads/images/suche.png"})
+        self.assertEqual(
+            ergebnis,
+            "![Suche](/uploads/images/suche.png) und ![Extern](https://example.com/a.png)",
+        )
+
+    def test_keeps_optional_title(self):
+        md = '![Suche](bilder/suche.png "Die Suchmaske")'
+        ergebnis = _rewrite_image_links(md, {"bilder/suche.png": "/u/s.png"})
+        self.assertEqual(ergebnis, '![Suche](/u/s.png "Die Suchmaske")')
+
+    def test_leaves_plain_links_untouched(self):
+        md = "[kein Bild](bilder/suche.png)"
+        self.assertEqual(_rewrite_image_links(md, {"bilder/suche.png": "/u/s.png"}), md)
+
+
+class ZipExportImageTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "a.png").write_bytes(PNG_1PX)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_zip_uses_bsexport_token_and_declares_image(self):
+        sections = [{"title": "Seite", "content": "![Alt](a.png)"}]
+        bilder = _collect_local_images(sections, self.dir)
+        data = build_data_json("Buch", "", sections, "produkt", "inst", None, bilder)
+        seite = data["book"]["pages"][0]
+        self.assertEqual(seite["markdown"], "![Alt]([[bsexport:image:1]])")
+        self.assertEqual(
+            seite["images"],
+            [{"id": 1, "name": "a.png", "file": "a.png", "type": "gallery"}],
+        )
+
+    def test_image_on_two_pages_is_declared_once(self):
+        sections = [{"title": "Eins", "content": "![A](a.png)"},
+                    {"title": "Zwei", "content": "![B](a.png)"}]
+        bilder = _collect_local_images(sections, self.dir)
+        data = build_data_json("Buch", "", sections, "produkt", "inst", None, bilder)
+        eins, zwei = data["book"]["pages"]
+        # Deklaration nur bei der ersten Seite -- doppelte IDs verletzen die
+        # Eindeutigkeitspruefung des BookStack-Imports.
+        self.assertEqual(len(eins["images"]), 1)
+        self.assertEqual(zwei["images"], [])
+        # Der Verweis funktioniert trotzdem auf beiden Seiten.
+        self.assertIn("[[bsexport:image:1]]", eins["markdown"])
+        self.assertIn("[[bsexport:image:1]]", zwei["markdown"])
+
+    def test_zip_without_images_keeps_empty_list(self):
+        sections = [{"title": "Seite", "content": "nur Text"}]
+        data = build_data_json("Buch", "", sections, "produkt", "inst")
+        self.assertEqual(data["book"]["pages"][0]["images"], [])
+
+
+class UpsertGalleryImageTests(unittest.TestCase):
+    """Die Wiedererkennung ist der kritische Teil: ohne sie legt jeder Lauf
+    eine weitere Kopie an, weil BookStack Dateinamen beim Upload eindeutig macht."""
+
+    def setUp(self):
+        self.aufrufe: list[dict] = []
+
+        def _fake_api_request(method, url, headers, data=None, content_type=None):
+            self.aufrufe.append({"method": method, "url": url})
+            return {"id": 99, "name": "suche.png", "url": "/uploads/images/suche.png"}
+
+        patcher = mock.patch.object(pub, "_api_request", _fake_api_request)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_uploads_when_gallery_is_empty(self):
+        vorhandene: list[dict] = []
+        url = pub.upsert_gallery_image("https://bs", {}, 7, "suche.png", PNG_1PX,
+                                       "image/png", vorhandene)
+        self.assertEqual(url, "/uploads/images/suche.png")
+        self.assertEqual(len(self.aufrufe), 1)
+        self.assertEqual(self.aufrufe[0]["method"], "POST")
+
+    def test_reuses_existing_image_on_same_page(self):
+        vorhandene = [{"name": "suche.png", "uploaded_to": 7, "url": "/uploads/alt.png"}]
+        url = pub.upsert_gallery_image("https://bs", {}, 7, "suche.png", PNG_1PX,
+                                       "image/png", vorhandene)
+        self.assertEqual(url, "/uploads/alt.png")
+        self.assertEqual(self.aufrufe, [], "es darf kein Upload stattfinden")
+
+    def test_same_name_on_other_page_is_uploaded_separately(self):
+        # uploaded_to gehoert zur Identitaet: dasselbe Bild auf einer anderen
+        # Seite ist in BookStack ein eigener Galerie-Eintrag.
+        vorhandene = [{"name": "suche.png", "uploaded_to": 3, "url": "/uploads/alt.png"}]
+        url = pub.upsert_gallery_image("https://bs", {}, 7, "suche.png", PNG_1PX,
+                                       "image/png", vorhandene)
+        self.assertEqual(url, "/uploads/images/suche.png")
+        self.assertEqual(len(self.aufrufe), 1)
+
+    def test_second_call_in_same_run_reuses_first_upload(self):
+        vorhandene: list[dict] = []
+        for _ in range(2):
+            pub.upsert_gallery_image("https://bs", {}, 7, "suche.png", PNG_1PX,
+                                     "image/png", vorhandene)
+        self.assertEqual(len(self.aufrufe), 1, "der zweite Aufruf darf nicht erneut hochladen")
 
 
 if __name__ == "__main__":
